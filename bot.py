@@ -204,6 +204,9 @@ async def publish(kind, day, refresh=False):
         target = game_for(kind, day)
         if old and old["id"] == target["id"] and not refresh and old["message_id"]:
             return
+        if setting("send_uncertain"):
+            log.error("Publish blocked: unresolved send_uncertain=%s", setting("send_uncertain"))
+            return False
         if old and not await delete_message(old):
             # Fail closed: never publish a second message while an old one might exist.
             log.error("Publish postponed: unable to remove previous message %s", old["message_id"])
@@ -213,9 +216,6 @@ async def publish(kind, day, refresh=False):
         view_mode[target["id"]] = "main"
         # If sending times out, Telegram might still have posted the message.
         # Record uncertainty and block automatic duplicates until inspected.
-        if setting("send_uncertain"):
-            log.error("Publish blocked: unresolved send_uncertain=%s", setting("send_uncertain"))
-            return False
         try:
             sent = await bot.send_message(CHAT_ID, poll_text(target), reply_markup=keyboard(),
                                           parse_mode="HTML")
