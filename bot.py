@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -171,12 +172,17 @@ async def update_poll(game):
 
 async def delete_message(game):
     if not game or not game["message_id"]:
-        return
+        return True
     try:
         await bot.delete_message(CHAT_ID, game["message_id"])
+        return True
     except Exception as exc:
-        log.warning("Failed to delete message %s, manual cleanup may be needed: %s",
-                    game["message_id"], exc)
+        reason = str(exc).lower()
+        if "message to delete not found" in reason:
+            return True
+        log.error("Failed to delete message %s (retained in database): %s",
+                  game["message_id"], exc)
+        return False
 
 
 async def close_game():
@@ -184,9 +190,12 @@ async def close_game():
         game = current()
         if not game:
             return
-        await delete_message(game)
+        if not await delete_message(game):
+            # Keep ID for a later retry; don't silently lose the cleanup target.
+            return False
         view_mode.pop(game["id"], None)
         db.execute("UPDATE games SET active=0,message_id=NULL WHERE id=?", (game["id"],))
+        return True
 
 
 async def publish(kind, day, refresh=False):
@@ -195,20 +204,35 @@ async def publish(kind, day, refresh=False):
         target = game_for(kind, day)
         if old and old["id"] == target["id"] and not refresh and old["message_id"]:
             return
-        if old:
-            await delete_message(old)
-            view_mode.pop(old["id"], None)
-            db.execute("UPDATE games SET active=0,message_id=NULL WHERE id=?", (old["id"],))
+        if old and not await delete_message(old):
+            # Fail closed: never publish a second message while an old one might exist.
+            log.error("Publish postponed: unable to remove previous message %s", old["message_id"])
+            return False
         revision = 1 if refresh else target["revision"]
         target = db.execute("SELECT * FROM games WHERE id=?", (target["id"],)).fetchone()
         view_mode[target["id"]] = "main"
-        sent = await bot.send_message(CHAT_ID, poll_text(target), reply_markup=keyboard(),
-                                      parse_mode="HTML")
+        # If sending times out, Telegram might still have posted the message.
+        # Record uncertainty and block automatic duplicates until inspected.
+        if setting("send_uncertain"):
+            log.error("Publish blocked: unresolved send_uncertain=%s", setting("send_uncertain"))
+            return False
+        try:
+            sent = await bot.send_message(CHAT_ID, poll_text(target), reply_markup=keyboard(),
+                                          parse_mode="HTML")
+        except Exception as exc:
+            put_setting("send_uncertain", target["game_key"])
+            log.error("Send result unknown for game %s: %s. Check Telegram chat and "
+                      "use /resolve_send in private after manual verification.", target["game_key"], exc)
+            return False
+        if old:
+            view_mode.pop(old["id"], None)
+            db.execute("UPDATE games SET active=0,message_id=NULL WHERE id=?", (old["id"],))
         db.execute(
             "UPDATE games SET active=1,message_id=?,revision=? WHERE id=?",
             (sent.message_id, revision, target["id"]))
         log.info("Published game=%s message=%s revision=%s", target["game_key"],
                  sent.message_id, revision)
+        return True
 
 
 def desired_window(instant):
@@ -254,6 +278,42 @@ async def reconcile():
                       "preserving message_id=%s for later retry", active["message_id"])
     else:
         await publish(kind, game_date, refresh=refreshed)
+
+
+@router.message(Command("resolve_send"))
+async def resolve_send(message: Message):
+    # Administrator must inspect the Telegram chat first. This command only
+    # releases the duplicate-prevention lock, it never deletes chat messages.
+    if not message.from_user or message.from_user.id not in ADMINS or message.chat.type != "private":
+        return
+    pending = setting("send_uncertain")
+    if not pending:
+        await message.answer("Нет неопределённых отправок.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or parts[1] != "CONFIRM":
+        await message.answer(f"Неопределённая отправка: {pending}. Проверь группу. "
+                             "Если сообщение уже появилось, НЕ снимай блокировку — "
+                             "сначала сообщи об этом для восстановления ID. "
+                             "Если сообщения точно нет, введи /resolve_send CONFIRM.")
+        return
+    async with lock:
+        put_setting("send_uncertain", "")
+    await message.answer("Блокировка снята. Следующая проверка расписания повторит публикацию.")
+
+
+def backup_database():
+    dest = Path(DB_PATH).parent / "backups"
+    dest.mkdir(parents=True, exist_ok=True)
+    filename = dest / ("meetup-" + now().strftime("%Y%m%d-%H%M%S") + ".sqlite3")
+    try:
+        with sqlite3.connect(str(filename)) as copy:
+            db.backup(copy)
+        for file in sorted(dest.glob("meetup-*.sqlite3"))[:-14]:
+            file.unlink()
+        log.info("Database backup created: %s", filename)
+    except Exception:
+        log.exception("SQLite backup failed")
 
 
 @router.message(Command("start"))
@@ -506,12 +566,22 @@ async def run():
     scheduler.add_job(reconcile, "cron", day_of_week="fri", hour=11, minute=0, id="sun_open")
     scheduler.add_job(reconcile, "cron", day_of_week="sun", hour=10, minute=55, id="sun_refresh")
     scheduler.add_job(reconcile, "cron", day_of_week="sun", hour=15, minute=0, id="sun_close")
+    # Periodically repair an edit that failed when Telegram was unavailable.
+    scheduler.add_job(reconcile, "interval", minutes=15, id="network_recovery",
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(backup_database, "cron", hour=3, minute=15, id="sqlite_backup")
     scheduler.start()
+    # Do not stall polling during a long startup Telegram timeout.
+    recovery = asyncio.create_task(reconcile(), name="initial_reconcile")
+    backup_database()
     try:
-        await reconcile()
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         scheduler.shutdown(wait=False)
+        if not recovery.done():
+            recovery.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await recovery
         await bot.session.close()
         db.close()
 
