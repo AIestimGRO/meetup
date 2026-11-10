@@ -135,7 +135,7 @@ def poll_text(game, mode="main"):
         result.append("Пока никого нет.")
     result += ["", "💳 — заявил о переводе · 💵 — заявил о наличных",
                "⏳ — ждём подтверждения · ✅ — организатор подтвердил",
-               "Добавить можно до 3 друзей. Оплатить — за каждого или за всех."]
+               "До 3 друзей, даже без своей записи. Оплата — за каждого или за всех."]
     if mode == "payment":
         receiver, number = setting("receiver_name"), setting("receiver_phone")
         result += ["", "💳 <b>ОПЛАТА</b>"]
@@ -370,21 +370,19 @@ async def vote(call: CallbackQuery):
                 db.execute("INSERT INTO slots(game_id,owner_id,owner_name,friend_no) VALUES(?,?,?,0)",
                            (game["id"], user.id, name))
         elif action == "leave":
-            if not my:
-                notice = "Вас нет в списке."
-            else:
-                db.execute("DELETE FROM slots WHERE game_id=? AND owner_id=?", (game["id"],user.id))
-                notice = "Вы и ваши друзья удалены из записи."
-        elif action == "friend_add":
             if 0 not in nums:
-                notice = "Сначала запишитесь сами."
+                notice = "Вы сами не записаны. Друзья остаются в списке."
             else:
-                free = next((i for i in range(1,4) if i not in nums), None)
-                if free is None:
-                    notice = "Максимум 3 друга."
-                else:
-                    db.execute("INSERT INTO slots(game_id,owner_id,owner_name,friend_no) VALUES(?,?,?,?)",
-                               (game["id"],user.id,name,free))
+                db.execute("DELETE FROM slots WHERE game_id=? AND owner_id=? AND friend_no=0",
+                           (game["id"],user.id))
+                notice = "Ваша запись отменена. Добавленные друзья остаются в игре."
+        elif action == "friend_add":
+            free = next((i for i in range(1,4) if i not in nums), None)
+            if free is None:
+                notice = "Максимум 3 друга."
+            else:
+                db.execute("INSERT INTO slots(game_id,owner_id,owner_name,friend_no) VALUES(?,?,?,?)",
+                           (game["id"],user.id,name,free))
         elif action == "friend_del":
             friends = [i for i in nums if i > 0]
             if not friends:
