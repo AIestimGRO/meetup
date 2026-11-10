@@ -148,8 +148,8 @@ def poll_text(game, mode="main"):
                    "После отметки организатор проверит и подтвердит оплату."]
     elif mode == "contact":
         result += ["", "📞 <b>АДМИНИСТРАТОР ПОЛЯ</b>",
-                   f"Номер: <a href=\"tel:{FIELD_ADMIN_PHONE}\">{FIELD_ADMIN_PHONE}</a>",
-                   "Нажмите на номер, чтобы позвонить (зависит от приложения Telegram)."]
+                   f"Номер для звонка: {FIELD_ADMIN_PHONE}",
+                   "Нажмите на номер, если ваш Telegram предлагает звонок, либо скопируйте его."]
     return "\n".join(result)
 
 
@@ -233,7 +233,13 @@ async def reconcile():
         active = current()
         same = active and active["game_key"] == f"{game_date.isoformat()}-{kind}"
         valid = same and active["message_id"] and (not refreshed or active["revision"] >= 1)
-    if not valid:
+    if valid:
+        # Refresh the existing Telegram message after deployment/restart.
+        # Same message ID; preserve game, slots and payment statuses.
+        async with lock:
+            await update_poll(current())
+        log.info("Refreshed existing poll after startup/reconcile: %s", active["message_id"])
+    else:
         await publish(kind, game_date, refresh=refreshed)
 
 
