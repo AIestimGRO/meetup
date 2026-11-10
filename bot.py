@@ -155,15 +155,18 @@ def poll_text(game, mode="main"):
 
 async def update_poll(game):
     if not game or not game["message_id"]:
-        return
+        return False
     try:
         await bot.edit_message_text(
             chat_id=CHAT_ID, message_id=game["message_id"],
             text=poll_text(game, view_mode.get(game["id"], "main")),
             reply_markup=keyboard(view_mode.get(game["id"], "main")), parse_mode="HTML")
+        return True
     except Exception as exc:
-        if "message is not modified" not in str(exc).lower():
-            log.error("Cannot edit poll: %s", exc)
+        if "message is not modified" in str(exc).lower():
+            return True
+        log.error("Cannot edit poll message_id=%s: %s", game["message_id"], exc)
+        return False
 
 
 async def delete_message(game):
@@ -234,11 +237,21 @@ async def reconcile():
         same = active and active["game_key"] == f"{game_date.isoformat()}-{kind}"
         valid = same and active["message_id"] and (not refreshed or active["revision"] >= 1)
     if valid:
-        # Refresh the existing Telegram message after deployment/restart.
-        # Same message ID; preserve game, slots and payment statuses.
-        async with lock:
-            await update_poll(current())
-        log.info("Refreshed existing poll after startup/reconcile: %s", active["message_id"])
+        # Refresh the same message after restart. Retry transient Telegram timeouts,
+        # but never send a replacement poll or discard existing registrations.
+        for attempt in range(1, 4):
+            async with lock:
+                latest = current()
+                ok = await update_poll(latest)
+            if ok:
+                log.info("Existing poll successfully updated: message_id=%s", latest["message_id"])
+                break
+            if attempt < 3:
+                log.warning("Retrying edit of existing poll (%d/3)", attempt + 1)
+                await asyncio.sleep(3 * attempt)
+        else:
+            log.error("Existing poll could not be updated after 3 attempts; "
+                      "preserving message_id=%s for later retry", active["message_id"])
     else:
         await publish(kind, game_date, refresh=refreshed)
 
