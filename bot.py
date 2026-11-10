@@ -651,6 +651,8 @@ async def confirm_payment(call: CallbackQuery):
     if method not in ("transfer","cash"):
         await call.answer("Некорректный способ оплаты.",show_alert=True)
         return
+    changed = False
+    affected_game_id = None
     async with lock:
         row = db.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
         game = latest_game()
@@ -663,11 +665,15 @@ async def confirm_payment(call: CallbackQuery):
             db.execute("UPDATE slots SET payment=? WHERE id=?",
                        ("confirmed_"+method,slot_id))
             log.info("Payment confirmed: slot=%s actor=%s method=%s",slot_id,call.from_user.id,method)
-            active = current()
-            if active and active["id"] == row["game_id"]:
-                await update_poll(active)
+            changed = True
+            affected_game_id = row["game_id"]
             await call.answer("✅ Получение денег подтверждено.")
     await redraw_panel(call,page)
+    # Updating the group poll may take time during Telegram outages.
+    # The financial panel should remain responsive; periodic recovery also repairs it.
+    active = current()
+    if changed and active and active["id"] == affected_game_id:
+        asyncio.create_task(update_poll(active))
 
 
 async def run():
