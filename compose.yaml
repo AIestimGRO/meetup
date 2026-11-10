@@ -1,0 +1,10 @@
+services:
+  football-bot:
+    build: .
+    image: meetup-football-bot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true
