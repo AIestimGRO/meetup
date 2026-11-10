@@ -316,6 +316,230 @@ def backup_database():
         log.exception("SQLite backup failed")
 
 
+# Private admin console. Command names here are kept in sync with the handlers.
+ADMIN_HELP = {
+    "games": (
+        "⚽ <b>Голосовалки</b>\n\n"
+        "/status — показать текущую запись.\n"
+        "/publish_wednesday — опубликовать запись на ближайшую среду.\n"
+        "/publish_sunday — опубликовать запись на ближайшее воскресенье.\n"
+        "/close — удалить и закрыть текущую запись.\n\n"
+        "⏰ Авторасписание: вторник 10:00, четверг 09:55; пятница 11:00, "
+        "воскресенье обновление 10:55 и закрытие 15:00 (Москва).\n"
+        "⚠️ После /close внутри активного окна планировщик может снова создать запись."
+    ),
+    "finance": (
+        "💰 <b>Оплаты и получатель</b>\n\n"
+        "/payments — интерактивная панель подтверждения оплат.\n"
+        "/receiver — текущие реквизиты переводов.\n"
+        "/set_receiver +79991234567 Иван — задать телефон и имя.\n"
+        "/clear_receiver — убрать реквизиты.\n\n"
+        "Оплату подтверждай только после поступления денег. "
+        "Номер получателя виден участникам при открытии оплаты. "
+        "Банк пока не задаётся отдельно."
+    ),
+    "people": (
+        "👤 <b>Сборщик денег</b>\n\n"
+        "/collector — проверить назначенного сборщика.\n"
+        "/set_collector 123456789 Иван — назначить сборщика по Telegram ID.\n"
+        "/clear_collector — отозвать права сборщика.\n\n"
+        "Также можно ответить /set_collector на сообщение участника в группе. "
+        "Сборщик получает доступ к /payments в личном чате, "
+        "но не к другим административным настройкам.\n"
+        "Важно: назначение /set_receiver НЕ назначает роль сборщика."
+    ),
+    "recovery": (
+        "🛠 <b>Диагностика и восстановление</b>\n\n"
+        "/resolve_send — показать статус блокировки неопределённой отправки.\n"
+        "/resolve_send CONFIRM — снять блокировку ТОЛЬКО после проверки, "
+        "что сообщения действительно нет в группе.\n\n"
+        "При нестабильной связи бот не делает повторные публикации вслепую; "
+        "повторно проверяет активную запись каждые 15 минут. "
+        "SQLite хранится в /opt/football-bot/data.\n"
+        "Логи на VPS: <code>docker compose logs --tail=50</code>"
+    ),
+}
+
+
+def admin_console_keyboard(section="home"):
+    if section == "home":
+        rows = [
+            [InlineKeyboardButton(text="⚽ Голосовалки",callback_data="adm:games"),
+             InlineKeyboardButton(text="💰 Оплаты",callback_data="adm:finance")],
+            [InlineKeyboardButton(text="👤 Сборщик",callback_data="adm:people"),
+             InlineKeyboardButton(text="🛠 Диагностика",callback_data="adm:recovery")],
+            [InlineKeyboardButton(text="📚 Все команды",callback_data="adm:all")],
+        ]
+    elif section == "games":
+        rows = [
+            [InlineKeyboardButton(text="📋 Текущая запись",callback_data="adm:status")],
+            [InlineKeyboardButton(text="📅 Создать на среду",callback_data="adm:ask_wed"),
+             InlineKeyboardButton(text="📅 На воскресенье",callback_data="adm:ask_sun")],
+            [InlineKeyboardButton(text="🛑 Закрыть запись",callback_data="adm:ask_close")],
+        ]
+    elif section == "finance":
+        rows = [
+            [InlineKeyboardButton(text="💳 Открыть оплаты",callback_data="adm:payments")],
+            [InlineKeyboardButton(text="📱 Текущий получатель",callback_data="adm:receiver")],
+            [InlineKeyboardButton(text="✍️ Как изменить реквизиты",callback_data="adm:finance_help")],
+            [InlineKeyboardButton(text="🗑 Убрать реквизиты",callback_data="adm:ask_clear_receiver")],
+        ]
+    elif section == "people":
+        rows = [
+            [InlineKeyboardButton(text="👤 Текущий сборщик",callback_data="adm:collector")],
+            [InlineKeyboardButton(text="✍️ Как назначить сборщика",callback_data="adm:people_help")],
+            [InlineKeyboardButton(text="🚫 Отозвать доступ",callback_data="adm:ask_clear_collector")],
+        ]
+    elif section == "recovery":
+        rows = [
+            [InlineKeyboardButton(text="🔎 Проверить отправку",callback_data="adm:resolve_status")],
+            [InlineKeyboardButton(text="📘 Правила восстановления",callback_data="adm:recovery_help")],
+        ]
+    elif section == "all":
+        rows = [
+            [InlineKeyboardButton(text="⚽ Голосовалки",callback_data="adm:games"),
+             InlineKeyboardButton(text="💰 Финансы",callback_data="adm:finance")],
+            [InlineKeyboardButton(text="👤 Сборщик",callback_data="adm:people"),
+             InlineKeyboardButton(text="🛠 Восстановление",callback_data="adm:recovery")],
+        ]
+    elif section.startswith("ask_"):
+        operation = section[4:]
+        rows = [[InlineKeyboardButton(text="✅ Подтвердить действие",callback_data=f"adm:do_{operation}")],
+                [InlineKeyboardButton(text="❌ Отмена",callback_data="adm:home")]]
+    else:
+        rows = []
+    if section != "home" and not section.startswith("ask_"):
+        rows.append([InlineKeyboardButton(text="⬅️ Главное меню",callback_data="adm:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_console_text(section="home"):
+    if section == "home":
+        active = current()
+        line = f"Игра: {html.escape(active['game_date'])} · {len(players(active['id']))} записей" if active else "Сейчас нет активной голосовалки"
+        return ("🛡 <b>АДМИН-ПАНЕЛЬ FOOTBALL BOT</b>\n"
+                f"{line}\n\nВыбирай раздел. Внутри — кнопки действий, "
+                "подсказки и команды. Панель доступна только администраторам.")
+    if section == "all":
+        return ("📚 <b>КОМАНДЫ БОТА</b>\n\n"
+                "/admin — эта панель\n/start — инструкция\n/status — текущая запись\n"
+                "/publish_wednesday, /publish_sunday, /close — игры\n"
+                "/payments, /receiver, /set_receiver, /clear_receiver — деньги\n"
+                "/collector, /set_collector, /clear_collector — сборщик\n"
+                "/resolve_send, /resolve_send CONFIRM — сбои\n\n"
+                "Нажми раздел, чтобы увидеть назначение и пример каждой команды.")
+    if section in ADMIN_HELP:
+        return ADMIN_HELP[section]
+    return "🛡 Админ-панель"
+
+
+@router.message(Command("admin"))
+async def admin_console(message: Message):
+    if not message.from_user or message.from_user.id not in ADMINS:
+        if message.chat.type == "private":
+            await message.answer("Административная панель недоступна.")
+        return
+    if message.chat.type != "private":
+        await message.answer("🔒 Админ-панель доступна только в личном чате с ботом. Отправь там /admin.")
+        return
+    await message.answer(admin_console_text(), parse_mode="HTML",
+                         reply_markup=admin_console_keyboard())
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def admin_console_action(call: CallbackQuery):
+    if not call.from_user or call.from_user.id not in ADMINS or call.message.chat.type != "private":
+        await call.answer("Доступ запрещён.",show_alert=True)
+        return
+    action = call.data[4:]
+    if action in ("home","games","finance","people","recovery","all"):
+        text = admin_console_text(action)
+        markup = admin_console_keyboard(action)
+    elif action.endswith("_help") and action[:-5] in ADMIN_HELP:
+        category = action[:-5]
+        text = admin_console_text(category)
+        markup = admin_console_keyboard(category)
+    elif action == "status":
+        game = current()
+        text = ("📋 <b>Текущая запись</b>\n\n"+poll_text(game)) if game else "Сейчас нет открытой записи."
+        markup = admin_console_keyboard("games")
+    elif action == "receiver":
+        name, phone = setting("receiver_name"),setting("receiver_phone")
+        text = ("💳 <b>Получатель переводов</b>\n"+
+                (f"{html.escape(name)} · <code>{html.escape(phone)}</code>" if name else
+                 "Не назначен.\nПример: <code>/set_receiver +79991234567 Иван</code>"))
+        markup = admin_console_keyboard("finance")
+    elif action == "collector":
+        ident, name = setting("collector_id"),setting("collector_name")
+        text = ("👤 <b>Сборщик денег</b>\n"+
+                (f"{html.escape(name)} · ID <code>{ident}</code>" if ident else
+                 "Не назначен.\nПример: <code>/set_collector 123456789 Иван</code>"))
+        markup = admin_console_keyboard("people")
+    elif action == "resolve_status":
+        pending=setting("send_uncertain")
+        text=("🛠 <b>Проверка публикации</b>\n"+
+              (f"⚠️ Неопределённая отправка: {html.escape(pending)}\n"
+               "Проверь группу. Если сообщение точно не появилось, отправь "
+               "<code>/resolve_send CONFIRM</code>. Не выполняй команду вслепую." if pending
+               else "✅ Блокировки неопределённой отправки нет."))
+        markup=admin_console_keyboard("recovery")
+    elif action == "payments":
+        text,markup=panel_data()
+        await call.message.answer(text,parse_mode="HTML",reply_markup=markup)
+        await call.answer("Панель оплат открыта.")
+        return
+    elif action.startswith("ask_"):
+        op=action[4:]
+        labels={"wed":"публикацию на среду","sun":"публикацию на воскресенье",
+                "close":"закрытие текущей записи","clear_receiver":"удаление реквизитов",
+                "clear_collector":"отзыв доступа сборщика"}
+        if op not in labels:
+            await call.answer("Неизвестная операция.",show_alert=True)
+            return
+        text=f"⚠️ <b>Подтвердить {labels[op]}?</b>\nДействие будет выполнено только после нажатия кнопки."
+        if op == "close":
+            text+="\nАвтопроверка может восстановить запись в активном окне расписания."
+        markup=admin_console_keyboard(action)
+    elif action.startswith("do_"):
+        op=action[3:]
+        if op not in ("wed","sun","close","clear_receiver","clear_collector"):
+            await call.answer("Неизвестная операция.",show_alert=True)
+            return
+        if op in ("wed","sun"):
+            kind="wed" if op=="wed" else "sun"
+            date=now().date()
+            offset=((2 if kind=="wed" else 6)-date.weekday())%7
+            ok=await publish(kind,date+timedelta(days=offset))
+            text=("✅ Голосовалка создана или уже существует." if ok is not False else
+                  "⚠️ Не удалось опубликовать. Проверь логи и /resolve_send, повторять вслепую не нужно.")
+        elif op=="close":
+            ok=await close_game()
+            text="✅ Голосовалка закрыта." if ok else "⚠️ Удаление не удалось — ID сохранён для повторной попытки."
+        elif op=="clear_receiver":
+            async with lock:
+                put_setting("receiver_name","")
+                put_setting("receiver_phone","")
+                active=current()
+            if active:
+                asyncio.create_task(update_poll(active))
+            text="✅ Реквизиты получателя удалены."
+        else:
+            put_setting("collector_id","")
+            put_setting("collector_name","")
+            text="✅ Доступ сборщика отозван."
+        markup=admin_console_keyboard("home")
+    else:
+        await call.answer("Неизвестный раздел.",show_alert=True)
+        return
+    try:
+        await call.message.edit_text(text,parse_mode="HTML",reply_markup=markup)
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            log.error("Admin menu cannot be edited: %s",exc)
+            await call.message.answer(text,parse_mode="HTML",reply_markup=markup)
+    await call.answer()
+
+
 @router.message(Command("start"))
 async def start(message: Message):
     await message.answer("⚽ Записывайтесь кнопками под голосовалкой в группе. "
