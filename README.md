@@ -107,3 +107,32 @@ docker tag meetup-football-bot:offline meetup-football-bot:latest
 docker compose up -d --no-build --force-recreate
 docker compose logs --tail=50
 ```
+
+## Финансовая панель сборщика (v2.3)
+
+Администратор назначает сборщика по его **числовому Telegram ID** (реквизиты перевода `/set_receiver` сами по себе НЕ дают доступ к панели):
+
+- В группе: ответьте командой `/set_collector` на сообщение нужного участника.
+- Или в личке с ботом: `/set_collector 123456789 Иван`.
+- `/collector` — проверить назначенного сборщика.
+- `/clear_collector` — отозвать его доступ.
+
+Сборщик должен открыть личный чат с ботом и нажать **Start**, затем отправить `/payments`. Финансовая панель показывает последнюю игру, числа заявленных и подтверждённых оплат, статусы участников и кнопки напротив ещё не подтверждённых записей. Кнопки работают постранично (6 участников на страницу), есть «Обновить».
+
+Нажатие на участника открывает экран **подтверждения получения денег**. Если тот заявил «Перевёл» или «Наличными», отображается соответствующая кнопка подтверждения; если ничего не заявлял, сборщик вручную выбирает перевод или наличные. После подтверждения обновляются база, панель и общая голосовалка. Сборщик не получает доступа к публикациям и другим административным командам.
+
+Для назначения одного и того же человека получателем переводов и сборщиком нужно выполнить **две отдельные команды**: `/set_receiver +79991234567 Иван` и `/set_collector <TELEGRAM_ID> Иван`. Предпочтительный банк пока отдельно не настраивается.
+
+### Обновление работающего VPS без обращения к Docker Hub
+
+```bash
+cd /opt/football-bot
+docker compose stop
+cp data/meetup.sqlite3 data/meetup-backup-before-v23.sqlite3
+git pull --ff-only
+docker build --pull=false -f Dockerfile.offline -t meetup-football-bot:offline .
+docker tag meetup-football-bot:offline meetup-football-bot:latest
+docker compose up -d --no-build --force-recreate
+docker compose ps
+docker compose logs --tail=50
+```
