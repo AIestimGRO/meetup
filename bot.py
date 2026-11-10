@@ -542,9 +542,16 @@ async def admin_console_action(call: CallbackQuery):
 
 @router.message(Command("start"))
 async def start(message: Message):
-    await message.answer("⚽ Записывайтесь кнопками под голосовалкой в группе. "
-                         "Можно добавить до 3 друзей. Отмечайте переводы и наличные; "
-                         "организатор подтверждает поступление. /status — текущая игра.")
+    text = ("⚽ Записывайтесь кнопками под голосовалкой в группе. "
+            "Можно добавить до 3 друзей. Отмечайте переводы и наличные; "
+            "организатор подтверждает поступление. /status — текущая игра.")
+    if message.from_user and message.from_user.id in ADMINS and message.chat.type == "private":
+        text += "\n\n🛡 Администратор: /admin — панель с командами и подсказками."
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛡 Открыть админ-панель",callback_data="adm:home")]
+        ]))
+    else:
+        await message.answer(text)
 
 
 @router.message(Command("status"))
