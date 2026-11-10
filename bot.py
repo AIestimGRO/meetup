@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -18,6 +19,7 @@ CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
 ADMINS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 PRICE = int(os.environ.get("PRICE_RUB", "0"))
 DB_PATH = os.environ.get("DATABASE_PATH", "/data/meetup.sqlite3")
+FIELD_ADMIN_PHONE = "+79653743566"
 if not TOKEN or TOKEN == "PUT_NEW_TOKEN_HERE" or not CHAT_ID or not ADMINS:
     raise RuntimeError("Set BOT_TOKEN, CHAT_ID, ADMIN_IDS in .env")
 Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -40,7 +42,10 @@ CREATE TABLE IF NOT EXISTS slots(
  UNIQUE(game_id,owner_id,friend_no)
 );
 """)
+db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 lock = asyncio.Lock()
+view_mode = {}
+
 bot = Bot(token=TOKEN)
 router = Router()
 dp = Dispatcher()
@@ -70,22 +75,36 @@ def game_for(kind, day):
     return row
 
 
-def keyboard():
-    rows = [
-        [InlineKeyboardButton(text="➕ Записаться",callback_data="join"),
-         InlineKeyboardButton(text="➖ Отменить",callback_data="leave")],
-        [InlineKeyboardButton(text="➕ 1 друг",callback_data="friend_add"),
-         InlineKeyboardButton(text="➖ 1 друг",callback_data="friend_del")],
-        [InlineKeyboardButton(text="💳 Перевёл за себя",callback_data="pay:0:transfer"),
-         InlineKeyboardButton(text="💵 Наличными за себя",callback_data="pay:0:cash")]
-    ]
-    for n in range(1,4):
-        rows.append([
-            InlineKeyboardButton(text=f"💳 Друг {n}",callback_data=f"pay:{n}:transfer"),
-            InlineKeyboardButton(text=f"💵 Друг {n}",callback_data=f"pay:{n}:cash")])
-    rows.append([
-        InlineKeyboardButton(text="💳 За всех",callback_data="pay:all:transfer"),
-        InlineKeyboardButton(text="💵 За всех",callback_data="pay:all:cash")])
+def setting(key):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else ""
+
+
+def put_setting(key, value):
+    db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+               (key,value))
+
+
+def keyboard(mode="main"):
+    if mode == "payment":
+        rows = [[InlineKeyboardButton(text="💳 Перевёл за себя", callback_data="pay:0:transfer"),
+                 InlineKeyboardButton(text="💵 Наличными за себя", callback_data="pay:0:cash")]]
+        for n in range(1,4):
+            rows.append([InlineKeyboardButton(text=f"💳 Друг {n}",callback_data=f"pay:{n}:transfer"),
+                         InlineKeyboardButton(text=f"💵 Друг {n}",callback_data=f"pay:{n}:cash")])
+        rows.append([InlineKeyboardButton(text="💳 За всех",callback_data="pay:all:transfer"),
+                     InlineKeyboardButton(text="💵 За всех",callback_data="pay:all:cash")])
+    elif mode == "contact":
+        rows = []
+    else:
+        rows = [[InlineKeyboardButton(text="➕ Записаться",callback_data="join"),
+                 InlineKeyboardButton(text="➖ Отменить",callback_data="leave")],
+                [InlineKeyboardButton(text="➕ 1 друг",callback_data="friend_add"),
+                 InlineKeyboardButton(text="➖ 1 друг",callback_data="friend_del")],
+                [InlineKeyboardButton(text="💳 Оплата",callback_data="menu:payment")],
+                [InlineKeyboardButton(text="📞 Администратор поля",callback_data="menu:contact")]]
+    if mode != "main":
+        rows.append([InlineKeyboardButton(text="⬅️ Назад к записи",callback_data="menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -99,7 +118,7 @@ def display(row):
     return name + " " + icon
 
 
-def poll_text(game):
+def poll_text(game, mode="main"):
     day = "СРЕДУ" if game["kind"] == "wed" else "ВОСКРЕСЕНЬЕ"
     listed = players(game["id"])
     result = [f"⚽ <b>ФУТБОЛ — {day}</b>",
@@ -117,6 +136,20 @@ def poll_text(game):
     result += ["", "💳 — заявил о переводе · 💵 — заявил о наличных",
                "⏳ — ждём подтверждения · ✅ — организатор подтвердил",
                "Добавить можно до 3 друзей. Оплатить — за каждого или за всех."]
+    if mode == "payment":
+        receiver, number = setting("receiver_name"), setting("receiver_phone")
+        result += ["", "💳 <b>ОПЛАТА</b>"]
+        if receiver and number:
+            result += [f"Получатель: <b>{html.escape(receiver)}</b>",
+                       f"Телефон для перевода: <code>{html.escape(number)}</code>"]
+        else:
+            result.append("Получатель перевода пока не назначен организатором.")
+        result += ["Выберите способ оплаты за себя, друга или всю компанию.",
+                   "После отметки организатор проверит и подтвердит оплату."]
+    elif mode == "contact":
+        result += ["", "📞 <b>АДМИНИСТРАТОР ПОЛЯ</b>",
+                   f"Номер: <a href=\"tel:{FIELD_ADMIN_PHONE}\">{FIELD_ADMIN_PHONE}</a>",
+                   "Нажмите на номер, чтобы позвонить (зависит от приложения Telegram)."]
     return "\n".join(result)
 
 
@@ -126,7 +159,8 @@ async def update_poll(game):
     try:
         await bot.edit_message_text(
             chat_id=CHAT_ID, message_id=game["message_id"],
-            text=poll_text(game), reply_markup=keyboard(), parse_mode="HTML")
+            text=poll_text(game, view_mode.get(game["id"], "main")),
+            reply_markup=keyboard(view_mode.get(game["id"], "main")), parse_mode="HTML")
     except Exception as exc:
         if "message is not modified" not in str(exc).lower():
             log.error("Cannot edit poll: %s", exc)
@@ -148,6 +182,7 @@ async def close_game():
         if not game:
             return
         await delete_message(game)
+        view_mode.pop(game["id"], None)
         db.execute("UPDATE games SET active=0,message_id=NULL WHERE id=?", (game["id"],))
 
 
@@ -159,9 +194,11 @@ async def publish(kind, day, refresh=False):
             return
         if old:
             await delete_message(old)
+            view_mode.pop(old["id"], None)
             db.execute("UPDATE games SET active=0,message_id=NULL WHERE id=?", (old["id"],))
         revision = 1 if refresh else target["revision"]
         target = db.execute("SELECT * FROM games WHERE id=?", (target["id"],)).fetchone()
+        view_mode[target["id"]] = "main"
         sent = await bot.send_message(CHAT_ID, poll_text(target), reply_markup=keyboard(),
                                       parse_mode="HTML")
         db.execute(
@@ -230,6 +267,66 @@ async def admin_command(message: Message):
     offset = ((2 if kind=="wed" else 6) - date.weekday()) % 7
     await publish(kind, date + timedelta(days=offset))
     await message.answer("Голосовалка опубликована.")
+
+
+@router.message(Command("set_receiver", "clear_receiver", "receiver"))
+async def set_receiver(message: Message):
+    if not message.from_user or message.from_user.id not in ADMINS:
+        return
+    command = message.text.split()[0].split("@")[0]
+    if command == "/receiver":
+        name, phone = setting("receiver_name"), setting("receiver_phone")
+        await message.answer(f"Получатель переводов: {name} — {phone}" if name else
+                             "Получатель не назначен.")
+        return
+    if command == "/clear_receiver":
+        async with lock:
+            put_setting("receiver_name", "")
+            put_setting("receiver_phone", "")
+            await update_poll(current())
+        await message.answer("Реквизиты переводов очищены.")
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer("Используй: /set_receiver +79991234567 Имя. "
+                             "Либо ответь командой на сообщение участника группы.")
+        return
+    phone = re.sub(r"[\\s()\\-]", "", parts[1])
+    if not re.fullmatch(r"\\+7\\d{10}", phone):
+        await message.answer("Укажи номер в формате +79991234567.")
+        return
+    replied = message.reply_to_message.from_user if message.reply_to_message else None
+    if replied and not replied.is_bot:
+        name = " ".join(filter(None, [replied.first_name, replied.last_name]))
+    elif len(parts) == 3 and parts[2].strip():
+        name = parts[2].strip()[:80]
+    else:
+        await message.answer("Укажи имя после номера либо ответь на сообщение участника.")
+        return
+    async with lock:
+        put_setting("receiver_name", name)
+        put_setting("receiver_phone", phone)
+        await update_poll(current())
+    await message.answer(f"Получатель назначен: {name}, {phone}. "
+                         "Номер виден в разделе оплаты.")
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def change_menu(call: CallbackQuery):
+    if not call.message or not call.from_user:
+        return
+    mode = call.data.split(":",1)[1]
+    if mode not in ("main","payment","contact"):
+        await call.answer("Неизвестное меню.",show_alert=True)
+        return
+    async with lock:
+        game = current()
+        if not game or call.message.chat.id != CHAT_ID or call.message.message_id != game["message_id"]:
+            await call.answer("Эта голосовалка закрыта.",show_alert=True)
+            return
+        view_mode[game["id"]] = mode
+        await update_poll(game)
+    await call.answer()
 
 
 @router.callback_query(F.data.in_({"join","leave","friend_add","friend_del"}) | F.data.startswith("pay:"))
