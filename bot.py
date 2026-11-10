@@ -291,8 +291,8 @@ async def set_receiver(message: Message):
         await message.answer("Используй: /set_receiver +79991234567 Имя. "
                              "Либо ответь командой на сообщение участника группы.")
         return
-    phone = re.sub(r"[\\s()\\-]", "", parts[1])
-    if not re.fullmatch(r"\\+7\\d{10}", phone):
+    phone = re.sub(r"[\s()\-]", "", parts[1])
+    if not re.fullmatch(r"\+7\d{10}", phone):
         await message.answer("Укажи номер в формате +79991234567.")
         return
     replied = message.reply_to_message.from_user if message.reply_to_message else None
