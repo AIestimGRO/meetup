@@ -471,90 +471,203 @@ async def vote(call: CallbackQuery):
     await call.answer(notice, show_alert=notice != "Готово")
 
 
-def payments_keyboard(items):
-    rows = []
-    for row in items[:80]:
-        state = row["payment"]
-        action = "✅" if state.startswith("pending_") else "✓"
-        suffix = "друг "+str(row["friend_no"]) if row["friend_no"] else "сам"
-        rows.append([InlineKeyboardButton(
-            text=f"{action} {row['owner_name'][:20]} ({suffix}) {state.replace('pending_','').replace('unpaid','—')}",
-            callback_data=f"confirm:{row['id']}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def can_collect(user_id):
+    return user_id in ADMINS or str(user_id) == setting("collector_id")
+
+
+def latest_game():
+    return db.execute("SELECT * FROM games ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def payment_label(payment):
+    return {
+        "unpaid": "⏳ Не заявлено",
+        "pending_transfer": "💳 Ожидает перевод",
+        "pending_cash": "💵 Ожидает наличные",
+        "confirmed_transfer": "✅ Перевод подтверждён",
+        "confirmed_cash": "✅ Наличные подтверждены",
+    }.get(payment, payment)
+
+
+PANEL_PAGE_SIZE = 6
+
+
+def panel_data(page=0):
+    game = latest_game()
+    if game is None:
+        return "⚽ Игр пока нет.", None
+    rows = players(game["id"])
+    total = len(rows)
+    confirmed = sum(row["payment"].startswith("confirmed_") for row in rows)
+    pending = sum(row["payment"].startswith("pending_") for row in rows)
+    page_count = max(1, (total + PANEL_PAGE_SIZE - 1) // PANEL_PAGE_SIZE)
+    page = max(0, min(page, page_count-1))
+    lines = [
+        f"💰 <b>ОПЛАТЫ — {html.escape(game['game_date'])}</b>",
+        f"👥 Всего: {total} · ✅ Подтверждено: {confirmed}",
+        f"💳/💵 Заявили: {pending} · ⏳ Не заявили: {total-confirmed-pending}",
+    ]
+    if PRICE:
+        lines.append(f"Собрано: {confirmed*PRICE:,} ₽ из {total*PRICE:,} ₽".replace(",", " "))
+    lines += ["", "Нажми на человека, чтобы подтвердить получение денег.",
+              f"Страница {page+1}/{page_count}"]
+    buttons = []
+    for item in rows[page*PANEL_PAGE_SIZE:(page+1)*PANEL_PAGE_SIZE]:
+        suffix = f" (друг {item['friend_no']})" if item["friend_no"] else ""
+        label = f"{item['owner_name'][:22]}{suffix}"
+        lines.append(f"• {html.escape(label)} — {payment_label(item['payment'])}")
+        if not item["payment"].startswith("confirmed_"):
+            buttons.append([InlineKeyboardButton(
+                text=f"✅ {label[:31]}",
+                callback_data=f"pc:{item['id']}:{page}")])
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="⬅️",callback_data=f"panel:{page-1}"))
+    navigation.append(InlineKeyboardButton(text="🔄 Обновить",callback_data=f"panel:{page}"))
+    if page+1 < page_count:
+        navigation.append(InlineKeyboardButton(text="➡️",callback_data=f"panel:{page+1}"))
+    buttons.append(navigation)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def redraw_panel(call, page=0):
+    text, markup = panel_data(page)
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            log.error("Cannot update payment panel: %s", exc)
+            await call.message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+@router.message(Command("set_collector", "collector", "clear_collector"))
+async def collector_config(message: Message):
+    if not message.from_user or message.from_user.id not in ADMINS:
+        return
+    command = message.text.split()[0].split("@")[0]
+    if command == "/collector":
+        selected = setting("collector_id")
+        name = setting("collector_name")
+        await message.answer(f"Сборщик: {name} · Telegram ID: {selected}" if selected
+                             else "Сборщик не назначен. Используй /set_collector в ответ на сообщение человека в группе или /set_collector 123456789 Имя.")
+        return
+    if command == "/clear_collector":
+        put_setting("collector_id", "")
+        put_setting("collector_name", "")
+        await message.answer("Доступ сборщика отозван. Администраторы сохраняют доступ.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    replied = message.reply_to_message.from_user if message.reply_to_message else None
+    if replied and not replied.is_bot:
+        user_id = replied.id
+        name = " ".join(filter(None, [replied.first_name, replied.last_name]))
+    elif len(parts) >= 3 and parts[1].isdigit() and int(parts[1]) > 0:
+        user_id = int(parts[1])
+        name = parts[2].strip()[:80]
+    else:
+        await message.answer("Ответь /set_collector на сообщение сборщика в группе, либо напиши /set_collector 123456789 Имя в личке с ботом.")
+        return
+    put_setting("collector_id", str(user_id))
+    put_setting("collector_name", name)
+    await message.answer(f"✅ Сборщик назначен: {name} (ID {user_id}). "
+                         "Теперь он открывает бота в личке, нажимает Start и отправляет /payments. "
+                         "Доступ только к оплатам, без административных команд.")
 
 
 @router.message(Command("payments"))
 async def payments(message: Message):
-    if message.from_user.id not in ADMINS:
+    if not message.from_user:
         return
     if message.chat.type != "private":
-        await message.answer("Откройте /payments в личном чате с ботом — не публикуем финансы в группе.")
+        await message.answer("Для приватности открой /payments в личном чате с ботом.")
         return
-    game = db.execute("SELECT * FROM games ORDER BY id DESC LIMIT 1").fetchone()
-    if not game:
-        await message.answer("Игр пока нет.")
+    if not can_collect(message.from_user.id):
+        await message.answer("Финансовая панель доступна только назначенному сборщику и администраторам.")
         return
-    pending = db.execute(
-        "SELECT * FROM slots WHERE game_id=? AND payment NOT LIKE 'confirmed_%' ORDER BY id",
-        (game["id"],)).fetchall()
-    confirmed = db.execute(
-        "SELECT count(*) n FROM slots WHERE game_id=? AND payment LIKE 'confirmed_%'",
-        (game["id"],)).fetchone()["n"]
-    if not pending:
-        await message.answer(f"Игра {game['game_date']}: все {confirmed} оплат подтверждены (или участников нет).")
-        return
-    await message.answer(
-        f"⚽ Игра {game['game_date']}\nПодтверждено: {confirmed}\n"
-        "Нажмите на строку, чтобы подтвердить получение оплаты. "
-        "Если человек не отмечал способ, выберите его после нажатия.\n"
-        "Обозначения: transfer — перевод, cash — наличные, — ещё не заявил.",
-        reply_markup=payments_keyboard(pending))
+    text, markup = panel_data()
+    await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
-@router.callback_query(F.data.startswith("confirm:"))
-async def admin_payment(call: CallbackQuery):
-    if call.from_user.id not in ADMINS or call.message.chat.type != "private":
-        await call.answer("Недостаточно прав.",show_alert=True)
+@router.callback_query(F.data.startswith("panel:"))
+async def panel_navigation(call: CallbackQuery):
+    if call.message.chat.type != "private" or not can_collect(call.from_user.id):
+        await call.answer("Нет доступа.",show_alert=True)
         return
-    slot_id = int(call.data.split(":")[1])
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.",show_alert=True)
+        return
+    await redraw_panel(call,page)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pc:"))
+async def payment_confirm_choice(call: CallbackQuery):
+    if call.message.chat.type != "private" or not can_collect(call.from_user.id):
+        await call.answer("Нет доступа.",show_alert=True)
+        return
+    try:
+        _, slot_id, page = call.data.split(":")
+        slot_id, page = int(slot_id), int(page)
+    except (ValueError, IndexError):
+        await call.answer("Ошибка выбора.",show_alert=True)
+        return
+    row = db.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
+    game = latest_game()
+    if not row or not game or row["game_id"] != game["id"] or row["payment"].startswith("confirmed_"):
+        await call.answer("Запись уже обработана или недоступна.",show_alert=True)
+        await redraw_panel(call,page)
+        return
+    method = row["payment"].split("_")[-1] if row["payment"].startswith("pending_") else ""
+    if method:
+        buttons = [[InlineKeyboardButton(text=f"✅ Подтвердить {('перевод' if method=='transfer' else 'наличные')}",
+                                         callback_data=f"pm:{slot_id}:{method}:{page}")]]
+    else:
+        buttons = [[InlineKeyboardButton(text="✅ Получил перевод",callback_data=f"pm:{slot_id}:transfer:{page}"),
+                    InlineKeyboardButton(text="✅ Получил наличные",callback_data=f"pm:{slot_id}:cash:{page}")]]
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку оплат",callback_data=f"panel:{page}")])
+    name = html.escape(row["owner_name"])
+    if row["friend_no"]:
+        name += f" (друг {row['friend_no']})"
+    await call.message.edit_text(
+        f"💰 <b>Подтвердить оплату?</b>\n{name}\n{payment_label(row['payment'])}\n"
+        "Нажимай подтверждение только после фактического получения денег.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pm:"))
+async def confirm_payment(call: CallbackQuery):
+    if call.message.chat.type != "private" or not can_collect(call.from_user.id):
+        await call.answer("Нет доступа.",show_alert=True)
+        return
+    try:
+        _, slot_id, method, page = call.data.split(":")
+        slot_id, page = int(slot_id), int(page)
+    except (ValueError, IndexError):
+        await call.answer("Ошибка данных.",show_alert=True)
+        return
+    if method not in ("transfer","cash"):
+        await call.answer("Некорректный способ оплаты.",show_alert=True)
+        return
     async with lock:
         row = db.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
-        if not row:
-            await call.answer("Запись уже удалена.", show_alert=True)
+        game = latest_game()
+        if not row or not game or row["game_id"] != game["id"]:
+            await call.answer("Запись недоступна.",show_alert=True)
             return
-        if row["payment"] == "unpaid":
-            keyboard_ = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Перевод",callback_data=f"final:{slot_id}:transfer"),
-                InlineKeyboardButton(text="✅ Наличные",callback_data=f"final:{slot_id}:cash")]])
-            await call.message.answer("Как получена оплата?",reply_markup=keyboard_)
-            await call.answer()
-            return
-        kind = row["payment"].split("_")[-1]
-        db.execute("UPDATE slots SET payment=? WHERE id=?",("confirmed_"+kind,slot_id))
-        await update_poll(current() if current() and current()["id"]==row["game_id"] else None)
-    await call.answer("Оплата подтверждена.")
-    await call.message.edit_reply_markup(reply_markup=None)
-
-
-@router.callback_query(F.data.startswith("final:"))
-async def manual_confirmation(call: CallbackQuery):
-    if call.from_user.id not in ADMINS or call.message.chat.type != "private":
-        await call.answer("Недостаточно прав.",show_alert=True)
-        return
-    _, id_string, kind = call.data.split(":")
-    if kind not in ("cash","transfer"):
-        await call.answer("Ошибка",show_alert=True)
-        return
-    async with lock:
-        row = db.execute("SELECT * FROM slots WHERE id=?", (int(id_string),)).fetchone()
-        if not row:
-            await call.answer("Запись не найдена.",show_alert=True)
-            return
-        db.execute("UPDATE slots SET payment=? WHERE id=?",("confirmed_"+kind,row["id"]))
-        active = current()
-        await update_poll(active if active and active["id"] == row["game_id"] else None)
-    await call.answer("Подтверждено")
-    await call.message.edit_reply_markup(reply_markup=None)
+        if row["payment"].startswith("confirmed_"):
+            await call.answer("Уже подтверждено.")
+        else:
+            db.execute("UPDATE slots SET payment=? WHERE id=?",
+                       ("confirmed_"+method,slot_id))
+            log.info("Payment confirmed: slot=%s actor=%s method=%s",slot_id,call.from_user.id,method)
+            active = current()
+            if active and active["id"] == row["game_id"]:
+                await update_poll(active)
+            await call.answer("✅ Получение денег подтверждено.")
+    await redraw_panel(call,page)
 
 
 async def run():
