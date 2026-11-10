@@ -1,0 +1,38 @@
+name: Check football bot
+on:
+  push:
+  pull_request:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile bot.py
+      - name: Schedule smoke test
+        env:
+          BOT_TOKEN: '123456:TESTtokenfortesting1234567'
+          CHAT_ID: '-1001234567890'
+          ADMIN_IDS: '1'
+          DATABASE_PATH: '/tmp/meetup-test.sqlite3'
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          from bot import desired_window
+          tz = ZoneInfo('Europe/Moscow')
+          def d(day, hour, minute):
+              return datetime(2026,11,day,hour,minute,tzinfo=tz)
+          assert desired_window(d(10,9,59)) is None
+          assert desired_window(d(10,10,0))[0] == 'wed'
+          assert desired_window(d(12,9,54))[0] == 'wed'
+          assert desired_window(d(12,9,55)) is None
+          assert desired_window(d(13,11,0))[0] == 'sun'
+          assert desired_window(d(15,10,54))[2] is False
+          assert desired_window(d(15,10,55))[2] is True
+          assert desired_window(d(15,14,59))[0] == 'sun'
+          assert desired_window(d(15,15,0)) is None
+          PY
