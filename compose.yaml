@@ -3,6 +3,9 @@ services:
     build: .
     image: meetup-football-bot:latest
     restart: unless-stopped
+    # This bot opens outgoing Telegram connections only; no ports are exposed.
+    # Work around VPS Docker bridge outbound routing failure.
+    network_mode: host
     env_file: .env
     volumes:
       - ./data:/data
