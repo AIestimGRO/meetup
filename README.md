@@ -136,3 +136,30 @@ docker compose up -d --no-build --force-recreate
 docker compose ps
 docker compose logs --tail=50
 ```
+
+## Панель администратора (v2.4)
+
+Отправьте **/admin** в личном чате с ботом, либо нажмите кнопку **«🛡 Открыть админ-панель»** после **/start**. Доступ строго по `ADMIN_IDS`, в группе меню не раскрывается.
+
+Разделы:
+- ⚽ Голосовалки — актуальная запись, публикация на среду/воскресенье, закрытие
+- 💰 Оплаты — переход к интерактивной панели, просмотр реквизитов, подсказка для `/set_receiver`, удаление реквизитов
+- 👤 Сборщик — просмотр, подсказка для `/set_collector`, отзыв доступа
+- 🛠 Диагностика — проверка неопределённой отправки, инструкция `/resolve_send`
+- 📚 Все команды — полный список и переход к пояснениям
+
+Удаление, закрытие и ручные публикации запрашивают подтверждение. Для назначения получателя/сборщика ввод команды с параметрами осуществляется сообщением в Telegram, с примером в меню. Если Telegram недоступен, некоторые операции могут завершиться ошибкой: состояние смотрите в логах VPS. Голосовалка и её участники остаются в SQLite.
+
+### Развёртывание обновления на текущем VPS (локальный образ, Docker Hub не нужен)
+
+```bash
+cd /opt/football-bot
+docker compose stop
+cp data/meetup.sqlite3 data/meetup-backup-before-v24.sqlite3
+git pull --ff-only
+docker build --pull=false -f Dockerfile.offline -t meetup-football-bot:offline .
+docker tag meetup-football-bot:offline meetup-football-bot:latest
+docker compose up -d --no-build --force-recreate
+docker compose ps
+docker compose logs --tail=50
+```
